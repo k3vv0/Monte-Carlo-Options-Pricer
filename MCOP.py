@@ -2,8 +2,9 @@ import keyboard
 import math
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import time
 import Util
+import yfinance as yf
 
 
 class Book:
@@ -103,47 +104,123 @@ class Option:
 
     # Returns all contracts in a given strike price range
     def contractByStrike(self, low, high):
-        print("Find contract by strike price... coming soon!")
+        df = pd.DataFrame()
+        for date in self.dates:
+            contracts = pd.DataFrame()
+            chain = self.sec.option_chain(date)
+            if self.call:
+                contracts = chain.calls
+            else:
+                contracts = chain.puts
+            contracts[['date']] = date
+            contracts[['ticker']] = self.ticker
+            contracts[['spot']] = self.spot
+            contracts = contracts[['date', 'strike', 'lastPrice', 'impliedVolatility', 'ticker', 'spot']]
+            contracts = contracts.loc[(contracts['strike'] >= low) & (contracts['strike'] <= high)]
+            # print(contracts)
+            df = pd.concat([df, contracts], ignore_index=True)
+        print(f"{df.shape[0]} contracts found for '{self.ticker}' strike price between ${low} and ${high}.")
+        df.sort_values(by=['strike', 'date'], inplace=True)
+        df = df.reset_index(drop=True)
+        results = Book(df)
+        choice = results.getChoice()
+        row = df.iloc[choice]
+        row = row[['ticker', 'date', 'strike', 'spot', 'lastPrice', 'impliedVolatility']]
+        return Contract(row)
 
-    # Returns all contracts in a given ask price range
-    def contractByAsk(self, low, high):
-        print("Find contract by last price... coming soon!")
+    # Returns all contracts in a given price range
+    def contractByPrice(self, low, high):
+        df = pd.DataFrame()
+        for date in self.dates:
+            contracts = pd.DataFrame()
+            chain = self.sec.option_chain(date)
+            if self.call:
+                contracts = chain.calls
+            else:
+                contracts = chain.puts
+            contracts[['date']] = date
+            contracts[['ticker']] = self.ticker
+            contracts[['spot']] = self.spot
+            contracts = contracts[['date', 'strike', 'lastPrice', 'impliedVolatility', 'ticker', 'spot']]
+            contracts = contracts.loc[(contracts['lastPrice'] >= low) & (contracts['lastPrice'] <= high)]
+            # print(contracts)
+            df = pd.concat([df, contracts], ignore_index=True)
+        print(f"{df.shape[0]} contracts found for '{self.ticker}' last price between ${low} and ${high}.")
+        df.sort_values(by=['lastPrice', 'date'], inplace=True)
+        df = df.reset_index(drop=True)
+        results = Book(df)
+        choice = results.getChoice()
+        row = df.iloc[choice]
+        row = row[['ticker', 'date', 'strike', 'spot', 'lastPrice', 'impliedVolatility']]
+        return Contract(row)
 
 
 # Simple Monte Carlo Pricing Class for Vanilla Call Option
 class SimpleMCPricer:
-    def __init__(self, contract, paths=1000000):
+    def __init__(self, contract, paths=100000000):
+        start = time.time()
         expiry = contract.expiry
         strike = contract.strike
         spot = contract.spot
         vol = contract.vol
-        # Calculate risk-free rate... coming soon!
-        r = 0.05
-        # The sigma value on the left side of the exponent
-        self.variance = vol ** 2 * expiry
-        # The sigma value on the right side of the e exponent
-        self.root_Variance = math.sqrt(self.variance)
-        # Corresponds to the (-1/2 * sigma^2)
-        self.itoCorr = -0.5 * self.variance
-        # Corresponds to S0e^(rT - 1/2 sigma^2T)
-        self.movedSpot = spot * math.exp(r * expiry + self.itoCorr)
-        self.runningSum = 0
-        # Simulate for all paths
-        for i in range(0, paths):
-            thisGauss = np.random.normal()
-            # Our rootVariance already has been multiplied by the expiry
-            thisSpot = self.movedSpot * math.exp(self.root_Variance * thisGauss)
-            # Determine payoff of this specific path
-            thisPayoff = thisSpot - strike
-            # Value of option is zero is our price is less than the strike
-            thisPayoff = thisPayoff if thisPayoff > 0 else 0
-            self.runningSum += thisPayoff
+        r = 0.05  # risk-free rate
 
-        self.mean = self.runningSum / paths
-        self.mean *= math.exp(-r * expiry)
+        # The sigma value on the left side of the exponent
+        variance = vol ** 2 * expiry
+        # The sigma value on the right side of the e exponent
+        root_variance = math.sqrt(variance)
+        # Corresponds to the (-1/2 * sigma^2)
+        ito_corr = -0.5 * variance
+        # Corresponds to S0e^(rT - 1/2 sigma^2T)
+        moved_spot = spot * math.exp(r * expiry + ito_corr)
+
+        # Simulate for all paths
+        gauss_rvs = np.random.normal(size=paths)
+        spot_paths = moved_spot * np.exp(root_variance * gauss_rvs)
+        payoffs = np.maximum(spot_paths - strike, 0)
+
+        self.mean = np.mean(payoffs) * math.exp(-r * expiry)
+        self.std_error = np.std(payoffs) / np.sqrt(paths) * math.exp(-r * expiry)
+        self.time = time.time()-start
 
     def getMean(self):
         return round(self.mean, 2)
+
+    def getStdError(self):
+        return round(self.std_error, 2)
+
+
+class AntitheticMCPricer:
+    def __init__(self, contract, paths=100000000):
+        start = time.time()
+        expiry = contract.expiry
+        strike = contract.strike
+        spot = contract.spot
+        vol = contract.vol
+        r = 0.05  # risk-free rate
+
+        variance = vol ** 2 * expiry
+        root_Variance = math.sqrt(variance)
+        itoCorr = -0.5 * variance
+        movedSpot = spot * math.exp(r * expiry + itoCorr)
+
+        # Simulate for all paths
+        paths //= 2  # since we will use each random variable twice
+        gauss_rvs = np.random.normal(size=paths)
+        gauss_rvs = np.concatenate((gauss_rvs, -gauss_rvs))  # Antithetic variates
+
+        spotPaths = movedSpot * np.exp(root_Variance * gauss_rvs)
+        payoffs = np.maximum(spotPaths - strike, 0)
+
+        self.mean = np.mean(payoffs) * math.exp(-r * expiry)
+        self.std_error = np.std(payoffs) / np.sqrt(paths * 2) * math.exp(-r * expiry)
+        self.time = time.time()-start
+
+    def getMean(self):
+        return round(self.mean, 2)
+
+    def getStdError(self):
+        return round(self.std_error, 2)
 
 
 # Set the display options
@@ -151,6 +228,17 @@ Util.openWindow()
 
 # Sample run
 ticker = Option(input("Enter a ticker: "))
-contract = ticker.contractByDate('2024-07-21', '2025-08-11')
-model = SimpleMCPricer(contract)
-print(model.getMean())
+contract = ticker.contractByDate('2023-07-21', '2023-08-21')
+model1 = SimpleMCPricer(contract)
+model2 = AntitheticMCPricer(contract)
+# print("Fair price: ", model.getMean())
+# contract = ticker.contractByStrike(45, 55)
+# model = SimpleMCPricer(contract)
+# contract = ticker.contractByPrice(20, 50)
+# model = SimpleMCPricer(contract)
+print("Simple Fair price: ", model1.getMean())
+print("Simple Std Error: ", model1.getStdError())
+print("Simple Time: ", model1.time, "\n")
+print("Antithetic Fair Price: ", model2.getMean())
+print("Antithetic Std Error: ", model2.getStdError())
+print("Antithetic Total Time: ", model2.time)
